@@ -168,7 +168,10 @@ class ChatReplayDownloader:
 
     def __session_get_json(self, url):
         """Make a request using the current session and get json data."""
-        json = self.__session_get(url).json()
+        try:
+            json = self.__session_get(url).json()
+        except json.JSONDecodeError as e:
+            raise ParsingError("Could not parse JSON from response to '{}':\n{}".format(url, e.doc)) from e
         #if self.debug_logger: self.debug_logger("=> JSON:\n{}", json)
         return json
 
@@ -658,7 +661,7 @@ if __name__ == '__main__':
             global num_of_messages
 
             # only file format capable of appending properly
-            with open(args.output, 'a', encoding='utf-8') as f:
+            with open(args.output, 'a', newline='', encoding='utf-8-sig') as f:
                 if('ticker_duration' not in item):  # needed for duplicates
                     num_of_messages += 1
                     print_item(item)
@@ -689,7 +692,7 @@ if __name__ == '__main__':
             if chat_messages and args.output:
                 if(args.output.endswith('.json')):
                     num_of_messages = len(chat_messages)
-                    with open(args.output, 'w') as f:
+                    with open(args.output, 'w', newline='', encoding='utf-8-sig') as f:
                         json.dump(chat_messages, f, sort_keys=True)
 
                 elif(args.output.endswith('.csv')):
@@ -699,7 +702,7 @@ if __name__ == '__main__':
                         fieldnames = list(set(fieldnames + list(message.keys())))
                     fieldnames.sort()
 
-                    with open(args.output, 'w', newline='', encoding='utf-8') as f:
+                    with open(args.output, 'w', newline='', encoding='utf-8-sig') as f:
                         fc = csv.DictWriter(f, fieldnames=fieldnames)
                         fc.writeheader()
                         fc.writerows(chat_messages)
