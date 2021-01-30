@@ -226,13 +226,13 @@ class ChatReplayDownloader:
     def message_to_string(self, item):
         """
         Format item for printing to standard output.
-        [time] (badges) *money* author: message,
-        where (badges) and *money* are optional.
+        [datetime] (author_type) *money* author: message,
+        where (author_type) and *money* are optional.
         """
         return '[{}] {}{}{}: {}'.format(
-            item['time_text'] if 'time_text' in item else (
-                self.__microseconds_to_timestamp(item['timestamp']) if 'timestamp' in item else ''),
-            '({}) '.format(item['badges']) if 'badges' in item else '',
+            item['datetime'] if 'datetime' in item else (
+                item['time_text'] if 'time_text' in item else ''),
+            '({}) '.format(item['author_type'].lower()) if 'author_type' in item else '',
             '*{}* '.format(item['amount']) if 'amount' in item else '',
             item.get('author', ''),
             item.get('message', '')
@@ -391,6 +391,7 @@ class ChatReplayDownloader:
         except:
             return default
 
+    __AUTHORTYPE_ORDER_MAP = {value: index for index, value in enumerate(('', 'VERIFIED', 'MEMBER', 'MODERATOR', 'OWNER'))}
     def __parse_item(self, item):
         """Parse YouTube item information."""
         data = {}
@@ -414,13 +415,23 @@ class ChatReplayDownloader:
             if(type(data[new_key]) is dict and 'simpleText' in data[new_key]):
                 data[new_key] = data[new_key]['simpleText']
 
-        if('authorBadges' in item_info):
+        author_badges = item_info.get('authorBadges')
+        if author_badges:
             badges = []
-            for badge in item_info['authorBadges']:
-                if('liveChatAuthorBadgeRenderer' in badge and 'tooltip' in badge['liveChatAuthorBadgeRenderer']):
-                    badges.append(
-                        badge['liveChatAuthorBadgeRenderer']['tooltip'])
+            author_type = ''
+            for badge in author_badges:
+                badge_renderer = badge.get('liveChatAuthorBadgeRenderer')
+                if badge_renderer:
+                    tooltip = badge_renderer.get('tooltip')
+                    icon_type = badge_renderer.get('icon', {}).get('iconType')
+                    if tooltip:
+                        badges.append(tooltip)
+                        if not icon_type:
+                            icon_type = 'MEMBER'
+                    if icon_type and (author_type == '' or self.__AUTHORTYPE_ORDER_MAP.get(icon_type, 0) >= self.__AUTHORTYPE_ORDER_MAP.get(author_type, 0)):
+                        author_type = icon_type
             data['badges'] = ', '.join(badges)
+            data['author_type'] = author_type
 
         if('showItemEndpoint' in item_info):  # has additional information
             data.update(self.__parse_item(
@@ -430,8 +441,11 @@ class ChatReplayDownloader:
         data['message'] = self.__parse_message_runs(
             data['message']['runs']) if 'message' in data else None
 
-        data['timestamp'] = int(
-            data['timestamp']) if 'timestamp' in data else None
+        timestamp = data.get('timestamp')
+        if timestamp:
+            timestamp = int(timestamp)
+            data['timestamp'] = timestamp
+            data['datetime'] = self.__microseconds_to_timestamp(timestamp)
 
         if('time_text' in data):
             data['time_in_seconds'] = int(
