@@ -159,17 +159,24 @@ class ChatReplayDownloader:
                     "The file '{}' could not be found.".format(cookies))
         self.session.cookies = cj
 
-    def __session_get(self, url):
+    def __session_get(self, url, post_payload=None):
         """Make a request using the current session."""
-        if self.debug_logger: self.debug_logger("HTTP GET {}", url)
-        response = self.session.get(url, timeout=10)
-        if self.debug_logger: self.debug_logger("HTTP GET {} => status={} len(text)={}", url, response.status_code, len(response.text))
+        if post_payload is None:
+            if self.debug_logger: self.debug_logger("HTTP GET {}", url)
+            response = self.session.get(url, timeout=10)
+            if self.debug_logger: self.debug_logger("HTTP GET {} => status={} len(text)={}", url, response.status_code, len(response.text))
+        else:
+            post_payload = json.dumps(post_payload)
+            if self.debug_logger: self.debug_logger("HTTP POST {} len(payload)={}", url, len(post_payload))
+            #if self.debug_logger: self.debug_logger("HTTP POST {}\n{}", url, post_payload) # too verbose
+            response = self.session.post(url, data=post_payload, timeout=10)
+            if self.debug_logger: self.debug_logger("HTTP POST {} len(payload)={} => status={} len(text)={}", url, len(post_payload), response.status_code, len(response.text))
         return response
 
-    def __session_get_json(self, url):
+    def __session_get_json(self, url, post_payload=None):
         """Make a request using the current session and get json data."""
         try:
-            json = self.__session_get(url).json()
+            json = self.__session_get(url, post_payload).json()
         except json.JSONDecodeError as e:
             raise ParsingError("Could not parse JSON from response to '{}':\n{}".format(url, e.doc)) from e
         #if self.debug_logger: self.debug_logger("=> JSON:\n{}", json)
@@ -180,7 +187,7 @@ class ChatReplayDownloader:
         Convert RFC3339 timestamp to microseconds.
         This is needed as datetime.datetime.strptime() does not support nanosecond precision.
         """
-        info = list(filter(None, re.split('[\.|Z]{1}', timestamp))) + [0]
+        info = list(filter(None, re.split(r'[\.|Z]{1}', timestamp))) + [0]
         return round((datetime.datetime.strptime('{}Z'.format(info[0]), '%Y-%m-%dT%H:%M:%SZ').timestamp() + float('0.{}'.format(info[1])))*1e6)
 
     def __time_to_seconds(self, time):
@@ -281,18 +288,33 @@ class ChatReplayDownloader:
 
         return message_text
 
-    _YT_INITIAL_DATA_RE = r'(?:window\s*\[\s*["\']ytInitialData["\']\s*\]|ytInitialData)\s*=\s*({.+?})\s*;'
+    _YT_CFG_RE = re.compile(r'\bytcfg\s*\.\s*set\(\s*({.*})\s*\)\s*;.*')
+    _YT_INITIAL_DATA_RE = re.compile(r'(?:\bwindow\s*\[\s*["\']ytInitialData["\']\s*\]|\bytInitialData)\s*=\s*(\{.+\})\s*;.*')
     def __get_initial_youtube_info(self, video_id):
         """ Get initial YouTube video information. """
         original_url = '{}/watch?v={}'.format(self.__YT_HOME, video_id)
         html = self.__session_get(original_url)
 
-        info = re.search(self._YT_INITIAL_DATA_RE, html.text)
+        json_decoder = json.JSONDecoder() # for more lenient raw_decode usage
 
-        if(not info):
+        m = self._YT_CFG_RE.search(html.text)
+        if not m:
+            raise ParsingError('Unable to parse video data. Please try again.')
+        ytcfg, _ = json_decoder.raw_decode(m.group(1))
+        if self.debug_logger: self.debug_logger("ytcfg:\n{}", json.dumps(ytcfg, indent=4))
+
+        config = {
+            'api_version': ytcfg['INNERTUBE_API_VERSION'],
+            'api_key': ytcfg['INNERTUBE_API_KEY'],
+            'context': ytcfg['INNERTUBE_CONTEXT'],
+        }
+        if self.debug_logger: self.debug_logger("config:\n{}", json.dumps(config, indent=4))
+
+        m = self._YT_INITIAL_DATA_RE.search(html.text)
+        if not m:
             raise ParsingError('Unable to parse video data. Please try again.')
 
-        ytInitialData = json.loads(info.group(1))
+        ytInitialData, _ = json_decoder.raw_decode(m.group(1))
         if self.debug_logger: self.debug_logger("ytInitialData:\n{}", json.dumps(ytInitialData, indent=4))
 
         contents = ytInitialData.get('contents')
@@ -321,27 +343,42 @@ class ChatReplayDownloader:
         }
         if self.debug_logger: self.debug_logger("continuation_by_title_map:\n{}", json.dumps(continuation_by_title_map, indent=4))
 
-        return continuation_by_title_map
+        return config, continuation_by_title_map
 
-    def __get_replay_info(self, continuation, offset_microseconds):
+    def __get_replay_info(self, config, continuation, offset_milliseconds):
         """Get YouTube replay info, given a continuation or a certain offset."""
-        url = self.__YOUTUBE_API_BASE_TEMPLATE.format(self.__YT_HOME,
-                                                      'live_chat_replay', 'get_live_chat_replay', continuation) + self.__YOUTUBE_API_PARAMETERS_TEMPLATE.format(offset_microseconds)
-        if self.debug_logger: self.debug_logger("get_replay_info: continuation={}, playerOffsetMs={}", continuation, offset_microseconds)
-        return self.__get_continuation_info(url)
+        url = self.__YOUTUBE_API_BASE_TEMPLATE.format(self.__YT_HOME, config['api_version'], 'get_live_chat_replay', config['api_key'])
+        if self.debug_logger: self.debug_logger("get_replay_info: continuation={}, playerOffsetMs={}", continuation, offset_milliseconds)
+        return self.__get_continuation_info(url, {
+            'context': config['context'],
+            'continuation': continuation,
+            'currentPlayerState': {
+                'playerOffsetMs': str(offset_milliseconds),
+            },
+        })
 
-    def __get_live_info(self, continuation):
+    def __get_live_info(self, config, continuation):
         """Get YouTube live info, given a continuation."""
-        url = self.__YOUTUBE_API_BASE_TEMPLATE.format(self.__YT_HOME,
-                                                      'live_chat', 'get_live_chat', continuation)
+        url = self.__YOUTUBE_API_BASE_TEMPLATE.format(self.__YT_HOME, config['api_version'], 'get_live_chat', config['api_key'])
         if self.debug_logger: self.debug_logger("get_live_info: continuation={}", continuation)
-        return(self.__get_continuation_info(url))
+        return self.__get_continuation_info(url, {
+            'context': config['context'],
+            'continuation': continuation,
+        })
 
-    def __get_continuation_info(self, url):
+    def __get_continuation_info(self, url, payload):
         """Get continuation info for a YouTube video."""
-        info = self.__session_get_json(url)
-        if('continuationContents' in info['response']):
-            return info['response']['continuationContents']['liveChatContinuation']
+        response = self.__session_get_json(url, payload)
+        error = response.get('error')
+        if error:
+            # Error code 403 'The caller does not have permission' error likely means the stream was privated immediately while the chat is still active.
+            if error.get['code'] == 403:
+                raise VideoUnavailable
+            else:
+                raise ParsingError("JSON response to '{}' is error:\n{}".format(url, json.dumps(response)))
+        info = response.get('continuationContents', {}).get('liveChatContinuation')
+        if info:
+            return info
         else:
             raise NoContinuation
 
@@ -417,7 +454,7 @@ class ChatReplayDownloader:
 
         offset_milliseconds = start_time * 1000 if start_time > 0 else 0
 
-        continuation_by_title_map = self.__get_initial_youtube_info(video_id)
+        config, continuation_by_title_map = self.__get_initial_youtube_info(video_id)
 
         # Top chat replay - Some messages, such as potential spam, may not be visible
         # Live chat replay - All messages are visible
@@ -441,18 +478,21 @@ class ChatReplayDownloader:
             while True:
                 try:
                     if(is_live):
-                        info = self.__get_live_info(continuation)
+                        info = self.__get_live_info(config, continuation)
                     else:
                         # must run to get first few messages, otherwise might miss some
                         if(first_time):
-                            info = self.__get_replay_info(continuation, 0)
+                            info = self.__get_replay_info(config, continuation, 0)
                             first_time = False
                         else:
-                            info = self.__get_replay_info(
-                                continuation, offset_milliseconds)
+                            info = self.__get_replay_info(config, continuation, offset_milliseconds)
 
                 except NoContinuation:
                     print('No continuation found, stream may have ended.')
+                    break
+
+                except VideoUnavailable:
+                    print('Video now unavailable, stream may have been privated while live chat was still active.')
                     break
 
                 if('actions' in info):
